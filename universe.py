@@ -1,192 +1,335 @@
 from numba import cuda
+from numba.cuda.random import create_xoroshiro128p_states as createRNGState, xoroshiro128p_normal_float64 as normal
+from typing import Tuple, Dict
 import numpy as np
-from typing import Tuple, Dict, List, Union
-from numba.cuda.random import create_xoroshiro128p_states as createStates, xoroshiro128p_normal_float32 as normal
-from math import ceil, isqrt, asin, sqrt, fabs as abs
-import pygame
+import math
+from random import randint
+
+foodColor = np.array((0, 0, 0, 0, 0, 0, 1)).astype(float)
+seekingAntColor = np.array((1, 0, 0, 0, 0, 0, 0)).astype(float)
+homingAntColor = np.array((0, 1, 0, 0, 0, 0, 0)).astype(float)
+colonyColor = np.array((0, 0, 0, 0, 0, 1, 0)).astype(float)
+HomeTrailColor = np.array((0, 0, 0, 0, 1, 0, 0)).astype(float)
+FoodTrailColor = np.array((0., 0., 0., 1., 0., 0., 0.))
 
 
-def randomPosition(maxCoord: Tuple[float, float]):
-    mult = np.array(maxCoord)
-    return tuple(np.random.random((2,)) * mult)
+def randomPos(dimensions: Tuple[int, int]):
+    return randint(0, dimensions[0] - 1), randint(0, dimensions[1] - 1)
 
 
-class Universe:
+# Each and every pixel on the drawn screen will actually contain multiple values
+# in order :
+# One dimension for seekingAnts, one for homing ants (two ants cannot coexist on the same pixel)
+# One dimension for an angle that the ant wants to move in (dim2)
+# One for each trail (dim 3 and 4)
+# one for the colony (dim 5)
+# one for the food (dim 6)
 
-    def __init__(self, antRange=5., antVisionAngle=110., antNb=5, foodNb=10, antSpeed=3., screenDim=(100, 100),
-                 evaporationMultiplier=0.99, antGrabbingRange=1.):
-        self.inverseGrabbingRange = 1 / antGrabbingRange
-        self.evaporationMultiplier = evaporationMultiplier
-        self.frame = 0
-        self.antSpeed = antSpeed
-        self.antVisionAngle = antVisionAngle
-        self.screenDim = screenDim
-        self.antRange = antRange
-        self.chunksDim = ceil(screenDim[0] / antRange), ceil(screenDim[1] / antRange)
-        self.chunks = [[[] for _ in range(self.chunksDim[1])]
-                       for _ in range(self.chunksDim[0])]
-        n = len(self.chunks)
-        p = len(self.chunks[0])
-        for ant in range(antNb):
-            self.chunks[n // 2][p // 2] = [0,
-                                           0,
-                                           self.screenDim[0] / 2,
-                                           self.screenDim[1] / 2,
-                                           np.random.random() * 360,
-                                           1,
-                                           0]
-        for ant in range(foodNb):
-            self.chunks[n // 2][p // 2] = [7,
-                                           0,
-                                           self.screenDim[0] / 2,
-                                           self.screenDim[1] / 2,
-                                           0,
-                                           1,
-                                           0]
-        # ants have id 0-4
-        # home trails have id 4
-        # food trails have id 5
-        # go back trails have id 6
-        # food has id 7
+class UniverseScreen:
+
+    def __init__(self, screenDim: Tuple[int, int] = None, imgArray: np.ndarray = None,
+                 antColonyCoord: Tuple[int, int] = None, diffusionFactor: float = 0.01,
+                 evaporationFactor: float = 0.99, antNb: int = 20, foodNb=40):
+        if imgArray is not None:
+            self.mainScreen = imgArray
+            self.screenDim = imgArray.shape[:2]
+            self.antNb = self.countAnts()
+        else:
+            assert screenDim is not None, "must specify screenDimensions if not image is given to save progress"
+            self.screenDim = screenDim
+            self.antNb = antNb
+            self.mainScreen = np.zeros(screenDim + (7,), float)
+            if antColonyCoord is not None:
+                self.mainScreen[antColonyCoord] = colonyColor
+                x, y = antColonyCoord
+            else:
+                x = screenDim[0] // 2
+                y = screenDim[1] // 2
+                self.mainScreen[x, y] += colonyColor
+            for _ in range(antNb):
+                x, y = randomPos(screenDim)
+                self.mainScreen[x, y] += (1, 0, np.random.random() * 2 * math.pi, 0, 0, 0, 0)
+            x, y = screenDim
+            for _ in range(foodNb):
+                dx, dy = np.random.randint(0, screenDim) // 5
+                self.mainScreen[x - dx - 1, y - dy - 1] += np.array(foodColor)
+        self.diffusionFactor = diffusionFactor
+        self.evaporationFactor = evaporationFactor
+
+    def countAnts(self) -> int:
+        count = 0
+        for pixel in self.mainScreen.reshape((self.screenDim[0] * self.screenDim[1], 7)):
+            if pixel[1] != 0. or pixel[0] != 0.:
+                count += 1
+        return count
 
     def update(self):
-        threadsPerBlock = 16, 16
-        x = ceil(self.chunksDim[0] / threadsPerBlock[0])
-        y = ceil(self.chunksDim[1] / threadsPerBlock[1])
-        blocksPerGrid = x, y
-        rngState = createStates(self.frame, 1)
-        numThreads = self.chunksDim[0] * self.chunksDim[1]
-        chunkless = [[] for i in range(numThreads)]
-        nestCoords = (self.screenDim[0] / 2,
-                      self.screenDim[1] / 2)
-        self._update[threadsPerBlock, blocksPerGrid](
-            self.chunks, self.antSpeed, self.antRange, self.antVisionAngle, rngState, self.antVisionAngle / 100,
-            self.evaporationMultiplier, chunkless, self.inverseGrabbingRange, nestCoords)
-        for item in chunkless:
-            x, y = item[2:4]
-            if x < 0 or x > self.screenDim[0]:
-                x = abs(self.screenDim[0] - x)
-            if y < 0 or y > self.screenDim[1]:
-                y = abs(self.screenDim[1] - y)
-            i, j = int(x / self.screenDim[0]), int(y / self.screenDim[1])
-            self.chunks[j][i].append(item)
+        n, p = self.screenDim
+        threadsPerBlock = (16, 16)
+        blocksPerGrid_x = math.ceil(n / threadsPerBlock[0])
+        blocksPerGrid_y = math.ceil(p / threadsPerBlock[1])
+        BlocksPerGrid = (blocksPerGrid_x, blocksPerGrid_y)
+        rng = createRNGState(256 * blocksPerGrid_x * blocksPerGrid_y, seed=1)
 
-    def draw(self, screen):
-        nestCoords = (self.screenDim[0] / 2,
-                      self.screenDim[1] / 2)
-        colors = [(255, 0, 0),
-                  (255, 255, 0),
-                  (255, 0, 255),
-                  (255, 120, 120),
-                  (0, 120, 255),
-                  (0, 255, 255),
-                  (120, 255, 255),
-                  (0, 255, 255)]
-        for _ in self.chunks:
-            for chunk in _:
-                for item in chunk:
-                    x = item[2]
-                    y = item[3]
-                    color = colors[item[0]]
-                    rect = pygame.Rect(x - 2, y - 2, 4, 4)
-                    pygame.draw.rect(screen, color, rect, 1)
-            colony = pygame.Rect(nestCoords[0] - 5, nestCoords[1] - 5, 10, 10)
-            color = (165, 42, 42)
-            pygame.draw.rect(screen, color, colony)
+        motionRequests = np.ones(self.screenDim + (3,), float) * (-1)
+
+        self.debugUpdate(self.mainScreen, self.diffusionFactor, self.evaporationFactor, motionRequests, rng)
+
+        # self._update[BlocksPerGrid, threadsPerBlock](self.mainScreen, self.diffusionFactor, self.evaporationFactor,
+        #                                              motionRequests, rng)
+        # all pixels are updated
+        destinations: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        n, p = motionRequests.shape[:2]
+        for i in range(n):
+            for j in range(p):
+                if motionRequests[i, j, 0] < 0:
+                    continue
+                else:
+                    # position adjustments
+                    x, y = motionRequests[i, j, :2]
+                    print(x, y, "before int")
+                    x, y = int(x), int(y)
+                    print(x, y, "after int")
+                    x, y = max(0, min(x, self.screenDim[0] - 1)), max(0, min(x, self.screenDim[1] - 1))
+                    while (x, y) in destinations or 0 > x or x > n or y < 0 or p < y:
+                        x += [-1, 0, 0, 1][randint(0, 3)]
+                        y += [-1, 0, 0, 1][randint(0, 3)]
+                    destinations[(x, y)] = (i, j)
+        # all ants can move
+        overWrittenAnts: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        for xf, yf in destinations:
+            xO, yO = destinations[xf, yf]  # ants origin
+            antType = 1
+            if self.mainScreen[xO, yO, 1] > .5:
+                antType = 2
+            # protecting the destination cell in case it contains a cell
+            if self.mainScreen[xf, yf, 1] > .5 or self.mainScreen[xf, yf, 0] > .5:
+                destType = 1
+                if self.mainScreen[xf, yf, 1] > .5:
+                    destType = 2
+                destAngle = self.mainScreen[xf, yf, 2]
+                overWrittenAnts[xf, yf] = destType, destAngle
+            # write into that space
+            if (xO, yO) in overWrittenAnts:
+                antType, angle = overWrittenAnts[xO, yO]
+                self.mainScreen[xf, yf, 2] = angle
+                self.mainScreen[xf, yf, antType - 1] = 1.
+            else:
+                self.mainScreen[xf, yf, :3] = self.mainScreen[xO, yO, :3]
+                self.mainScreen[xO, yO, :3] = (0., 0., 0.)
+        print(len(overWrittenAnts), len(destinations))
+
+    def draw(self):
+        n, p = self.screenDim
+        screen = np.zeros((n, p, 3), float)
+
+        threadsPerBlock = (16, 16)
+        blocksPerGrid_x = math.ceil(n / threadsPerBlock[0])
+        blocksPerGrid_y = math.ceil(p / threadsPerBlock[1])
+        BlocksPerGrid = (blocksPerGrid_x, blocksPerGrid_y)
+
+        self._draw[BlocksPerGrid, threadsPerBlock](self.mainScreen, screen)
+        return screen
 
     @staticmethod
     @cuda.jit
-    def _update(chunks, speed, visionRange, angle, rngState, AntSpeedDeviationFactor, evaporationMultiplier, chunkless,
-                inverseGrabbingRange, nestCoords):
-
-        def isInView(pos, alpha, item):
-            dx = item[2] - pos[0]
-            dy = item[3] - pos[1]
-            theta = asin(dx)
-            if abs(theta - alpha) < angle:
-                return sqrt(dx ** 2 + dy ** 2) < visionRange
-            else:
-                return False
-
-        def antMotion(neighbors, ant):
-            direction = [normal(rngState, ThreadId) * AntSpeedDeviationFactor,
-                         normal(rngState, ThreadIdPlus) * AntSpeedDeviationFactor]  # random deviation for exploration
-            for item in neighbors:
-                if not isInView(ant[2:4], ant[4], item):
-                    continue
-                if item[0] == ant[0] + 4.:
-                    # found the right trail
-                    inverseDistance = isqrt((item[2] - pos[0]) ** 2 + (item[3] - pos[1]) ** 2)
-                    signalAmplitude = item[1] * inverseDistance ** 2
-                    direction[0] += (item[2] - pos[0]) * signalAmplitude
-                    direction[1] += (item[3] - pos[1]) * signalAmplitude
-                elif item[0] == 7. and item[1] == 0. and ant[0] == 0.:
-                    # Food takes precedences and therefore returns it's own direction
-                    inverseDistance = isqrt((item[2] - pos[0]) ** 2 + (item[3] - pos[1]) ** 2)
-                    factor = inverseDistance * speed
-                    direction = [(item[2] - pos[0]) * factor,
-                                 (item[3] - pos[1]) * factor]
-                    if inverseDistance > inverseGrabbingRange:
-                        ant[0] = 1.
-                        ant[1] = direction[0]
-                        item[1] = direction[0]
-                    return direction
-                elif item[0] == 7. and ant[0] == 1. and ant[1] == item[1] and (
-                        distance := sqrt((nestCoords[0] - ant[2]) ** 2 + (nestCoords[1] - ant[3]) ** 2)) < visionRange:
-                    factor = speed / distance
-                    direction = [(item[2] - pos[0]) * factor,
-                                 (item[3] - pos[1]) * factor]
-                    if distance > 1 / inverseGrabbingRange:
-                        ant[1] = 1.
-                    return direction
-            normalisationFactor = isqrt(direction[0] ** 2 + direction[1] ** 2)
-            direction[0] *= normalisationFactor * speed
-            direction[1] *= normalisationFactor * speed
-            return direction
+    def _draw(mainScreen, realScreen):
 
         i, j = cuda.grid(2)
-        n, p = len(chunks), len(chunks[0])
-        ThreadId = n * i + j
-        ThreadIdPlus = n * p + ThreadId
-        if i < n and j < p:
-            additional_data = chunkless[ThreadId]
-            cur_chunk = chunks[i][j][:]  # we copy the chunk as a way of securing it
+        n, p, t = realScreen.shape
 
-            if len(cur_chunk) != 0:
-                neighbours = [[0., 0., 0., 0., 0., 0., 0.]]
-                for k in range(-1, 2):
-                    if 0 < i + k < n:
-                        for l in range(-1, 2):
-                            if 0 < j + l < p:
-                                neighbours += chunks[k][l]
-                if len(neighbours) > 1:
-                    neighbours = neighbours[1:]
-                else:
-                    # todo handle there being no neighbors
-                for index in range(len(cur_chunk)):
-                    item = cur_chunk[index]
-                    EntityType = item[0]
-                    timer = item[1]
-                    pos = item[2:4]
-                    alpha = item[4]
-                    vel = item[5:7]
-                    if EntityType < 4.:
-                        # Ant
-                        vel = antMotion(neighbours, item)
-                        timer += 0.03
-                        if timer > 0.5:
-                            timer = 0.
-                            additional_data.append([4 + EntityType, 1] + pos + [alpha] + vel)
-                        pos[0] += vel[0]
-                        pos[1] += vel[1]
-                        # food acquisition and relay
-                    elif 4. <= EntityType < 7.:
-                        # Trail
-                        timer = timer * evaporationMultiplier
-                        if timer < 0.001:
-                            cur_chunk = cur_chunk[:index] + cur_chunk[index + 1:]
-                            continue
+        def thereIsAHoleNearby(i, j):
+            for k in range(-2, 2):
+                for l in range(-2, 2):
+                    if n > i + k >= 0 and p > j + l >= 0:
+                        if mainScreen[i + k, j + l, 5] > .5:
+                            return True
+
+        if i < n and j < p:
+            if mainScreen[i, j, 6] > 0.5:
+                realScreen[i, j] = (1., 1., 1.)
+            elif mainScreen[i, j, 5] > 0.5:
+                realScreen[i, j] = 165 / 255, 42 / 255, 42 / 255
+            elif mainScreen[i, j, 0] > 0.5:
+                realScreen[i, j, 0] = 1.
+                realScreen[i, j, 1] = 0.
+                realScreen[i, j, 2] = 0.
+            elif mainScreen[i, j, 1] > 0.5:
+                realScreen[i, j, 0] = 1.
+                realScreen[i, j, 1] = 0.
+                realScreen[i, j, 2] = .7
+            elif thereIsAHoleNearby(i, j):
+                realScreen[i, j] = 165 / 257, 42 / 257, 42 / 257
+            else:
+                realScreen[i, j, 0] = .01
+                realScreen[i, j, 1] = mainScreen[i, j, 3]
+                realScreen[i, j, 2] = mainScreen[i, j, 4]
+
+    @staticmethod
+    @cuda.jit
+    def _update(screenArray, diff, evaporationFactor, motionRequests, rngState):
+        ## setting values
+        speed = 2
+        grabRange = 3
+        environmentRadius = 5
+
+        ## cuda handling
+        i, j = cuda.grid(2)
+        n, p, t = screenArray.shape
+        cudaIndex = n * i + p
+        ## algo
+        if i < n and j < p:
+            thisCell = screenArray[i, j]
+            antType = 0
+            if thisCell[0] == 1.:
+                antType = 1
+            elif thisCell[1] == 1.:
+                antType = 2
+            neighbours = screenArray[max(i - environmentRadius, 0):min(i + environmentRadius, n),
+                                     max(j - environmentRadius, 0):min(j + environmentRadius, p)]
+            xCur, yCur = (min(environmentRadius, i), min(environmentRadius, j))
+            trailCenter_0 = 0.
+            trailCenter_1 = 0.
+            trailCenter_2 = 0.
+            trailCenter_3 = 0.
+            foodCoord_0 = 0.
+            foodCoord_1 = 0.
+            foodFound = False
+            switching = 0.
+            nbCases = neighbours.shape[0] * neighbours.shape[1]
+            if antType != 0:
+                thisCell[antType + 2] += 1
+            for row in range(neighbours.shape[0]):
+                for col in range(neighbours.shape[1]):
+                    if xCur == row and yCur == col:
+                        continue
+                    inverseDistanceToCenter = 1 / math.sqrt((row - xCur) ** 2 + (col - yCur) ** 2)
+                    # Handling diffusion and evaporation
+                    thisCell[3] += neighbours[row, col, 3] * inverseDistanceToCenter * inverseDistanceToCenter * diff
+                    thisCell[4] += neighbours[row, col, 4] * inverseDistanceToCenter * inverseDistanceToCenter * diff
+                    trailCenter_0 += neighbours[row, col, 3] * (row - xCur) / nbCases
+                    trailCenter_2 += neighbours[row, col, 4] * (row - xCur) / nbCases
+                    trailCenter_1 += neighbours[row, col, 3] * (col - yCur) / nbCases
+                    trailCenter_3 += neighbours[row, col, 4] * (col - yCur) / nbCases
+                    if neighbours[row, col, 6] == 1. and not foodFound and antType == 1:
+                        foodCoord_0 = row
+                        foodCoord_1 = col
+                        if inverseDistanceToCenter > 1 / grabRange:
+                            switching = 1.
+                    elif neighbours[row, col, 5] == 1. and not foodFound and antType == 2:
+                        foodCoord_0 = row
+                        foodCoord_1 = col
+                        if inverseDistanceToCenter > 1 / grabRange:
+                            switching = 1.
+            thisCell[3] /= nbCases
+            thisCell[3] = max(0., thisCell[3] * evaporationFactor)
+            thisCell[4] /= nbCases
+            thisCell[4] = max(0., thisCell[4] * evaporationFactor)
+            angle = thisCell[2]
+            deviation = 0.
+            if antType != 0:
+                if not foodFound:
+                    if antType == 1:
+                        xO, yO = trailCenter_0, trailCenter_1
                     else:
-                        # Food
-                        pass
-            chunks[i][j] = cur_chunk
+                        xO, yO = trailCenter_2, trailCenter_3
+                else:
+                    xO, yO = foodCoord_0, foodCoord_1
+                if xO != 0 and yO != 0:
+                    angleOfInterest = math.atan(yO / xO)
+                    if abs(angleOfInterest - angle) > math.pi:
+                        deviation = math.pi - (angleOfInterest - angle)
+                    else:
+                        deviation = angleOfInterest - angle
+                deviation += normal(rngState, cudaIndex) * math.pi * 0.08
+                thisCell[2] += deviation / 30
+                motionRequests[i, j][0] = i + speed * math.cos(thisCell[2])
+                motionRequests[i, j][1] = j - speed * math.sin(thisCell[2])
+                motionRequests[i, j][2] = switching
+
+
+    @staticmethod
+    def debugUpdate(screenArray, diff, evaporationFactor, motionRequests, rngState):
+        ## setting values
+        speed = 2
+        grabRange = 3
+        environmentRadius = 5
+
+        ## cuda handling
+        n, p, t = screenArray.shape
+
+        ## algo
+        for i in range(n):
+            for j in range(p):
+                cudaIndex = n * i + p
+                thisCell = screenArray[i, j]
+                antType = 0
+                if thisCell[0] == 1.:
+                    antType = 1
+                elif thisCell[1] == 1.:
+                    antType = 2
+                neighbours = screenArray[max(i - environmentRadius, 0):min(i + environmentRadius, n),
+                             max(j - environmentRadius, 0):min(j + environmentRadius, p)]
+                xCur, yCur = (min(environmentRadius, i), min(environmentRadius, j))
+                trailCenter_0 = 0.
+                trailCenter_1 = 0.
+                trailCenter_2 = 0.
+                trailCenter_3 = 0.
+                foodCoord_0 = 0.
+                foodCoord_1 = 0.
+                foodFound = False
+                switching = 0.
+                nbCases = neighbours.shape[0] * neighbours.shape[1]
+                if antType != 0:
+                    thisCell[antType + 2] += 1
+                for row in range(neighbours.shape[0]):
+                    for col in range(neighbours.shape[1]):
+                        if xCur == row and yCur == col:
+                            continue
+                        inverseDistanceToCenter = 1 / math.sqrt((row - xCur) ** 2 + (col - yCur) ** 2)
+                        # Handling diffusion and evaporation
+                        thisCell[3] += neighbours[
+                                           row, col, 3] * inverseDistanceToCenter * inverseDistanceToCenter * diff
+                        thisCell[4] += neighbours[
+                                           row, col, 4] * inverseDistanceToCenter * inverseDistanceToCenter * diff
+                        trailCenter_0 += neighbours[row, col, 3] * (row - xCur) / nbCases
+                        trailCenter_2 += neighbours[row, col, 4] * (row - xCur) / nbCases
+                        trailCenter_1 += neighbours[row, col, 3] * (col - yCur) / nbCases
+                        trailCenter_3 += neighbours[row, col, 4] * (col - yCur) / nbCases
+                        if neighbours[row, col, 6] == 1. and not foodFound and antType == 1:
+                            foodCoord_0 = row
+                            foodCoord_1 = col
+                            if inverseDistanceToCenter > 1 / grabRange:
+                                switching = 1.
+                        elif neighbours[row, col, 5] == 1. and not foodFound and antType == 2:
+                            foodCoord_0 = row
+                            foodCoord_1 = col
+                            if inverseDistanceToCenter > 1 / grabRange:
+                                switching = 1.
+                thisCell[3] /= nbCases
+                thisCell[3] = max(0., thisCell[3] * evaporationFactor)
+                thisCell[4] /= nbCases
+                thisCell[4] = max(0., thisCell[4] * evaporationFactor)
+                angle = thisCell[2]
+                deviation = 0.
+                if antType != 0:
+                    if not foodFound:
+                        if antType == 1:
+                            xO, yO = trailCenter_0, trailCenter_1
+                        else:
+                            xO, yO = trailCenter_2, trailCenter_3
+                    else:
+                        xO, yO = foodCoord_0, foodCoord_1
+                    if xO != 0 and yO != 0:
+                        angleOfInterest = math.atan(yO / xO)
+                        if abs(angleOfInterest - angle) > math.pi:
+                            deviation = math.pi - (angleOfInterest - angle)
+                        else:
+                            deviation = angleOfInterest - angle
+                    deviation += np.random.normal(0, 1) * math.pi * 0.10
+                    print(deviation)
+                    thisCell[2] += deviation / 30
+                    print(speed, speed * math.cos(thisCell[2]), thisCell[2], speed * math.sin(thisCell[2]))
+                    motionRequests[i, j][0] = float(i) + speed * math.cos(thisCell[2])
+                    motionRequests[i, j][1] = float(j) - speed * math.sin(thisCell[2])
+                    motionRequests[i, j][2] = switching

@@ -1,19 +1,23 @@
-import pygame
-from universe import Universe
+from matplotlib import pyplot as plt, image
+from universe import UniverseScreen
 from numba import cuda, njit, jit, types
 
-pygame.init()
+size = height, width = 200, 200
 
-size = height, width = 1920, 760
-
-screen = pygame.display.set_mode(size)
 leaveMainLoop = False
 
-universe = Universe(5, 110., 5, 10, 1, size, antGrabbingRange=3.)
+universe = UniverseScreen(size, evaporationFactor=0.995, diffusionFactor=0.005)
+print(universe.countAnts())
 
 # main loop
 while not leaveMainLoop:
-    screen.fill((255, 255, 255))
-    pygame.display.flip()
-    universe.update()
-    universe.draw(screen)
+    try:
+        universe.update()
+        img = universe.draw()
+        plt.clf()
+        plt.imshow(img)
+        plt.draw()
+        plt.pause(1)
+    except KeyboardInterrupt:
+        leaveMainLoop = True
+        print(universe.mainScreen[:10, :10])
