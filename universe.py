@@ -35,7 +35,7 @@ class UniverseScreen:
             self.screenDim = imgArray.shape[:2]
             self.antNb = self.countAnts()
         else:
-            assert screenDim is not None, "must specify screenDimensions if not image is given to save progress"
+            assert screenDim is not None, "must specify screenDimensions if no image is given"
             self.screenDim = screenDim
             self.antNb = antNb
             self.mainScreen = np.zeros(screenDim + (7,), float)
@@ -73,10 +73,10 @@ class UniverseScreen:
 
         motionRequests = np.ones(self.screenDim + (3,), float) * (-1)
 
-        self.debugUpdate(self.mainScreen, self.diffusionFactor, self.evaporationFactor, motionRequests, rng)
+        # self.debugUpdate(self.mainScreen, self.diffusionFactor, self.evaporationFactor, motionRequests, rng)
 
-        # self._update[BlocksPerGrid, threadsPerBlock](self.mainScreen, self.diffusionFactor, self.evaporationFactor,
-        #                                              motionRequests, rng)
+        self._update[BlocksPerGrid, threadsPerBlock](self.mainScreen, self.diffusionFactor, self.evaporationFactor,
+                                                     motionRequests, rng)
         # all pixels are updated
         destinations: Dict[Tuple[int, int], Tuple[int, int]] = {}
         n, p = motionRequests.shape[:2]
@@ -87,10 +87,16 @@ class UniverseScreen:
                 else:
                     # position adjustments
                     x, y = motionRequests[i, j, :2]
-                    print(x, y, "before int")
-                    x, y = int(x), int(y)
-                    print(x, y, "after int")
-                    x, y = max(0, min(x, self.screenDim[0] - 1)), max(0, min(x, self.screenDim[1] - 1))
+                    if motionRequests[i, j, 2] > .5:
+                        # SWITCH MODE
+                        self.mainScreen[i, j, :2] = np.flip(self.mainScreen[i, j, :2], 0)
+                    x, y = int(x + .5), int(y + .5)
+                    if x < 0 or x >= n:
+                        x = max(0, min(x, n-1))
+                        self.mainScreen[i, j, 2] = (math.pi  - self.mainScreen[i, j, 2])
+                    if y < 0 or y >= n:
+                        y = max(0, min( y, n-1))
+                        self.mainScreen[i, j, 2] *= -1
                     while (x, y) in destinations or 0 > x or x > n or y < 0 or p < y:
                         x += [-1, 0, 0, 1][randint(0, 3)]
                         y += [-1, 0, 0, 1][randint(0, 3)]
@@ -121,13 +127,14 @@ class UniverseScreen:
 
     def draw(self):
         n, p = self.screenDim
-        screen = np.zeros((n, p, 3), float)
+        screen = np.ones((n, p, 3), float)
 
         threadsPerBlock = (16, 16)
         blocksPerGrid_x = math.ceil(n / threadsPerBlock[0])
         blocksPerGrid_y = math.ceil(p / threadsPerBlock[1])
         BlocksPerGrid = (blocksPerGrid_x, blocksPerGrid_y)
 
+        # self._debugDraw(self.mainScreen, screen)
         self._draw[BlocksPerGrid, threadsPerBlock](self.mainScreen, screen)
         return screen
 
@@ -145,9 +152,11 @@ class UniverseScreen:
                         if mainScreen[i + k, j + l, 5] > .5:
                             return True
 
+        realScreen[i, j, 1] -= mainScreen[i, j, 3]
+        realScreen[i, j, 2] -= mainScreen[i, j, 4]
         if i < n and j < p:
             if mainScreen[i, j, 6] > 0.5:
-                realScreen[i, j] = (1., 1., 1.)
+                realScreen[i, j] = (0., 0., 0.)
             elif mainScreen[i, j, 5] > 0.5:
                 realScreen[i, j] = 165 / 255, 42 / 255, 42 / 255
             elif mainScreen[i, j, 0] > 0.5:
@@ -155,23 +164,18 @@ class UniverseScreen:
                 realScreen[i, j, 1] = 0.
                 realScreen[i, j, 2] = 0.
             elif mainScreen[i, j, 1] > 0.5:
-                realScreen[i, j, 0] = 1.
-                realScreen[i, j, 1] = 0.
-                realScreen[i, j, 2] = .7
+                realScreen[i, j] = (1. + 0. + .7)
             elif thereIsAHoleNearby(i, j):
                 realScreen[i, j] = 165 / 257, 42 / 257, 42 / 257
-            else:
-                realScreen[i, j, 0] = .01
-                realScreen[i, j, 1] = mainScreen[i, j, 3]
-                realScreen[i, j, 2] = mainScreen[i, j, 4]
 
     @staticmethod
     @cuda.jit
     def _update(screenArray, diff, evaporationFactor, motionRequests, rngState):
         ## setting values
-        speed = 2
+        speed = 3
         grabRange = 3
         environmentRadius = 5
+        visionAngle = math.pi * 0.45
 
         ## cuda handling
         i, j = cuda.grid(2)
@@ -181,9 +185,9 @@ class UniverseScreen:
         if i < n and j < p:
             thisCell = screenArray[i, j]
             antType = 0
-            if thisCell[0] == 1.:
+            if thisCell[0] > .5:
                 antType = 1
-            elif thisCell[1] == 1.:
+            elif thisCell[1] > .5:
                 antType = 2
             neighbours = screenArray[max(i - environmentRadius, 0):min(i + environmentRadius, n),
                                      max(j - environmentRadius, 0):min(j + environmentRadius, p)]
@@ -195,25 +199,28 @@ class UniverseScreen:
             foodCoord_0 = 0.
             foodCoord_1 = 0.
             foodFound = False
+            foodCounter = 0
             switching = 0.
             nbCases = neighbours.shape[0] * neighbours.shape[1]
             if antType != 0:
-                thisCell[antType + 2] += 1
+                thisCell[antType + 2] += 1.
             for row in range(neighbours.shape[0]):
                 for col in range(neighbours.shape[1]):
                     if xCur == row and yCur == col:
                         continue
                     inverseDistanceToCenter = 1 / math.sqrt((row - xCur) ** 2 + (col - yCur) ** 2)
                     # Handling diffusion and evaporation
-                    thisCell[3] += neighbours[row, col, 3] * inverseDistanceToCenter * inverseDistanceToCenter * diff
-                    thisCell[4] += neighbours[row, col, 4] * inverseDistanceToCenter * inverseDistanceToCenter * diff
+                    factor = inverseDistanceToCenter * inverseDistanceToCenter * diff
+                    thisCell[3] += (neighbours[row, col, 3]-thisCell[3]) * factor
+                    thisCell[4] += (neighbours[row, col, 4]-thisCell[4]) * factor
                     trailCenter_0 += neighbours[row, col, 3] * (row - xCur) / nbCases
                     trailCenter_2 += neighbours[row, col, 4] * (row - xCur) / nbCases
                     trailCenter_1 += neighbours[row, col, 3] * (col - yCur) / nbCases
                     trailCenter_3 += neighbours[row, col, 4] * (col - yCur) / nbCases
-                    if neighbours[row, col, 6] == 1. and not foodFound and antType == 1:
-                        foodCoord_0 = row
-                        foodCoord_1 = col
+                    if neighbours[row, col, 6] == 1. and antType == 1:
+                        foodCoord_0 += row
+                        foodCoord_1 += col
+                        foodCounter += 1
                         if inverseDistanceToCenter > 1 / grabRange:
                             switching = 1.
                     elif neighbours[row, col, 5] == 1. and not foodFound and antType == 2:
@@ -221,22 +228,23 @@ class UniverseScreen:
                         foodCoord_1 = col
                         if inverseDistanceToCenter > 1 / grabRange:
                             switching = 1.
-            thisCell[3] /= nbCases
             thisCell[3] = max(0., thisCell[3] * evaporationFactor)
-            thisCell[4] /= nbCases
             thisCell[4] = max(0., thisCell[4] * evaporationFactor)
             angle = thisCell[2]
+            if foodCounter > 0:
+                foodCoord_0 /= foodCounter
+                foodCoord_1 /= foodCounter
             deviation = 0.
             if antType != 0:
                 if not foodFound:
-                    if antType == 1:
+                    if antType == 2:
                         xO, yO = trailCenter_0, trailCenter_1
                     else:
                         xO, yO = trailCenter_2, trailCenter_3
                 else:
                     xO, yO = foodCoord_0, foodCoord_1
                 if xO != 0 and yO != 0:
-                    angleOfInterest = math.atan(yO / xO)
+                    angleOfInterest = math.atan(xO / yO)
                     if abs(angleOfInterest - angle) > math.pi:
                         deviation = math.pi - (angleOfInterest - angle)
                     else:
@@ -246,7 +254,6 @@ class UniverseScreen:
                 motionRequests[i, j][0] = i + speed * math.cos(thisCell[2])
                 motionRequests[i, j][1] = j - speed * math.sin(thisCell[2])
                 motionRequests[i, j][2] = switching
-
 
     @staticmethod
     def debugUpdate(screenArray, diff, evaporationFactor, motionRequests, rngState):
@@ -264,12 +271,14 @@ class UniverseScreen:
                 cudaIndex = n * i + p
                 thisCell = screenArray[i, j]
                 antType = 0
-                if thisCell[0] == 1.:
+                if thisCell[0] > .5:
                     antType = 1
-                elif thisCell[1] == 1.:
+
+                elif thisCell[1] > .5:
                     antType = 2
+
                 neighbours = screenArray[max(i - environmentRadius, 0):min(i + environmentRadius, n),
-                             max(j - environmentRadius, 0):min(j + environmentRadius, p)]
+                                         max(j - environmentRadius, 0):min(j + environmentRadius, p)]
                 xCur, yCur = (min(environmentRadius, i), min(environmentRadius, j))
                 trailCenter_0 = 0.
                 trailCenter_1 = 0.
@@ -329,7 +338,39 @@ class UniverseScreen:
                     deviation += np.random.normal(0, 1) * math.pi * 0.10
                     print(deviation)
                     thisCell[2] += deviation / 30
-                    print(speed, speed * math.cos(thisCell[2]), thisCell[2], speed * math.sin(thisCell[2]))
                     motionRequests[i, j][0] = float(i) + speed * math.cos(thisCell[2])
                     motionRequests[i, j][1] = float(j) - speed * math.sin(thisCell[2])
                     motionRequests[i, j][2] = switching
+
+    @staticmethod
+    def _debugDraw(mainScreen, realScreen):
+
+        n, p, t = realScreen.shape
+
+        def thereIsAHoleNearby(i, j):
+            for k in range(-2, 2):
+                for l in range(-2, 2):
+                    if n > i + k >= 0 and p > j + l >= 0:
+                        if mainScreen[i + k, j + l, 5] > .5:
+                            return True
+
+        for i in range(n):
+            for j in range(p):
+                if mainScreen[i, j, 6] > 0.5:
+                    realScreen[i, j] = (0., 0., 0.)
+                elif mainScreen[i, j, 5] > 0.5:
+                    realScreen[i, j] = 165 / 255, 42 / 255, 42 / 255
+                elif mainScreen[i, j, 0] > 0.5:
+                    realScreen[i, j, 0] = 1.
+                    realScreen[i, j, 1] = 0.
+                    realScreen[i, j, 2] = 0.
+                elif mainScreen[i, j, 1] > 0.5:
+                    realScreen[i, j, 0] = 1.
+                    realScreen[i, j, 1] = 0.
+                    realScreen[i, j, 2] = .7
+                elif thereIsAHoleNearby(i, j):
+                    realScreen[i, j] = 165 / 257, 42 / 257, 42 / 257
+                else:
+                    realScreen[i, j, 0] = 1
+                    realScreen[i, j, 1] = 1-mainScreen[i, j, 3]
+                    realScreen[i, j, 2] = 1-mainScreen[i, j, 4]
